@@ -766,9 +766,7 @@ class VideoMergerApp:
         except OSError as e:
             messagebox.showerror("重命名错误", f"无法重命名 '{original_filename}' 为 '{new_filename}':\n{e}", parent=self.rename_window_ref)
 
-    def process_videos(self, input_dir, output_dir):
 
-    def process_videos(self, input_dir, output_dir):
         subfolders_to_process = []
         for item in os.listdir(input_dir):
             item_path = os.path.join(input_dir, item)
