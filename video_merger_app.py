@@ -441,32 +441,142 @@ class VideoMergerApp:
         input_folder = self.input_folder_var.get()
         output_folder = self.output_folder_var.get()
 
-        if not input_folder or not os.path.isdir(input_folder):
-            messagebox.showerror("错误", "请输入有效的输入文件夹路径。")
+        if not input_folder or not output_folder:
+            messagebox.showerror("错误", "请输入输入和输出文件夹路径。")
             return
-        if not output_folder or not os.path.isdir(output_folder):
-            messagebox.showerror("错误", "请输入有效的输出文件夹路径。")
+        if not os.path.isdir(input_folder):
+            messagebox.showerror("错误", f"输入文件夹路径无效: {input_folder}")
             return
+        if not os.path.isdir(output_folder):
+            try:
+                os.makedirs(output_folder)
+            except OSError as e:
+                messagebox.showerror("错误", f"无法创建输出文件夹: {output_folder}\n{e}")
+                return
 
+        self.overwrite_all_choice = None # Reset for each new batch operation
         self.start_button.config(state=tk.DISABLED)
-        self.progress_bar["value"] = 0
-        self.progress_label_var.set("状态: 准备中...")
+        self.progress_label_var.set("状态: 开始处理...")
+        self.progress_bar['value'] = 0
 
         # Run processing in a separate thread to keep UI responsive
-        thread = threading.Thread(target=self.process_videos, args=(input_folder, output_folder))
-        thread.daemon = True # Allows main program to exit even if thread is running
+        thread = threading.Thread(target=self.process_videos_in_thread, args=(input_folder, output_folder), daemon=True)
         thread.start()
 
-    def _get_video_files_in_folder(self, folder_path):
-        video_extensions = ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv'] # Add more if needed
-        video_files = []
-        if not folder_path or not os.path.isdir(folder_path):
-            return video_files
-        for f_name in sorted(os.listdir(folder_path)):
-            if os.path.isfile(os.path.join(folder_path, f_name)) and \
-               os.path.splitext(f_name)[1].lower() in video_extensions:
-                video_files.append(f_name)
-        return video_files
+    def process_videos_in_thread(self, input_folder, output_folder):
+        subfolders = [f.path for f in os.scandir(input_folder) if f.is_dir()]
+        total_folders = len(subfolders)
+        processed_count = 0
+        conversion_errors = []
+
+        for i, subfolder_path in enumerate(subfolders):
+            self.root.after(0, lambda p=i, t=total_folders: self.update_progress_bar_safe((p / t) * 100))
+            folder_name = os.path.basename(subfolder_path)
+            self.root.after(0, lambda fn=folder_name: self.update_progress_label_safe(f"处理中: {fn} ({i+1}/{total_folders})"))
+
+            m3u8_files = [f for f in os.listdir(subfolder_path) if f.endswith(".m3u8")]
+
+            if not m3u8_files:
+                self.log_history(subfolder_path, "N/A", "无m3u8文件跳过")
+                continue
+
+            # Assuming one m3u8 per subfolder for simplicity, or process all
+            for m3u8_file in m3u8_files: # Though typically one
+                input_m3u8_path = os.path.join(subfolder_path, m3u8_file)
+                # Sanitize output filename from folder_name or m3u8_file name
+                sanitized_folder_name = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in folder_name).rstrip()
+                output_filename = f"{sanitized_folder_name}.mp4"
+                output_mp4_path = os.path.join(output_folder, output_filename)
+
+                action = None
+                if os.path.exists(output_mp4_path):
+                    if self.overwrite_all_choice == 'yes_all':
+                        action = 'yes'
+                    elif self.overwrite_all_choice == 'no_all':
+                        action = 'no'
+                    else:
+                        # Use a queue to get the dialog result from the main thread
+                        dialog_q = queue.Queue()
+                        # Schedule the dialog to be shown in the main thread
+                        self.root.after(0, lambda: self.ask_user_for_overwrite(output_filename, dialog_q))
+                        # Wait for the dialog result
+                        action = dialog_q.get() # This blocks the worker thread until dialog is closed
+
+                        if action == 'yes_all':
+                            self.overwrite_all_choice = 'yes_all'
+                            action = 'yes' # Proceed with overwrite for current file
+                        elif action == 'no_all':
+                            self.overwrite_all_choice = 'no_all'
+                            action = 'no' # Proceed with skip for current file
+
+                if action == 'no':
+                    self.log_history(input_m3u8_path, output_filename, "已存在-跳过")
+                    processed_count +=1
+                    continue
+                elif action == 'cancel':
+                    self.log_history(input_m3u8_path, output_filename, "用户取消")
+                    self.root.after(0, lambda: self.update_progress_label_safe("状态: 用户中止"))
+                    self.root.after(0, lambda: self.start_button.config(state=tk.NORMAL))
+                    return # Abort all further processing
+
+                # FFmpeg command construction
+                command = [
+                    self.ffmpeg_path,
+                    '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,pipe',
+                    '-i', input_m3u8_path,
+                    '-c', 'copy',
+                    '-bsf:a', 'aac_adtstoasc',
+                    output_mp4_path
+                ]
+                if action == 'yes': # Overwrite if 'yes' or 'yes_all'
+                    command.insert(1, '-y')
+
+                try:
+                    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                    stdout, stderr = process.communicate()
+
+                    if process.returncode == 0:
+                        self.log_history(input_m3u8_path, output_filename, "成功")
+                        processed_count += 1
+                    else:
+                        error_msg = f"FFmpeg错误 ({output_filename}): {stderr.strip()}"
+                        self.log_history(input_m3u8_path, output_filename, f"失败: {process.returncode}")
+                        conversion_errors.append(error_msg)
+                        # Optionally show error for each failed conversion immediately or summarize later
+                        # self.root.after(0, lambda em=error_msg: messagebox.showerror("转换失败", em, parent=self.root))
+                except FileNotFoundError:
+                    error_msg = f"FFmpeg未找到。请确保ffmpeg已安装并配置在系统PATH中，或ffmpeg.exe在程序目录下。"
+                    self.log_history(input_m3u8_path, output_filename, "失败: FFmpeg未找到")
+                    conversion_errors.append(error_msg)
+                    # Stop further processing if ffmpeg is not found
+                    self.root.after(0, lambda em=error_msg: messagebox.showerror("严重错误", em, parent=self.root))
+                    self.root.after(0, lambda: self.start_button.config(state=tk.NORMAL))
+                    return
+                except Exception as e:
+                    error_msg = f"处理时发生未知错误 ({output_filename}): {e}"
+                    self.log_history(input_m3u8_path, output_filename, "失败: 未知错误")
+                    conversion_errors.append(error_msg)
+                    # self.root.after(0, lambda em=error_msg: messagebox.showerror("转换失败", em, parent=self.root))
+
+        # After loop completion
+        self.root.after(0, lambda: self.update_progress_bar_safe(100))
+        final_status_message = f"状态: 完成! 共处理 {processed_count}/{total_folders} 个文件夹."
+        if conversion_errors:
+            final_status_message += f" {len(conversion_errors)} 个发生错误."
+            # Show a summary of errors
+            self.root.after(0, lambda errs=list(conversion_errors): self.show_error_summary(errs))
+        self.root.after(0, lambda msg=final_status_message: self.update_progress_label_safe(msg))
+        self.root.after(0, lambda: self.start_button.config(state=tk.NORMAL))
+
+    def show_error_summary(self, errors):
+        summary = "以下文件转换失败:\n\n" + "\n".join(errors)
+        messagebox.showerror("转换错误概要", summary, parent=self.root)
+
+    def update_progress_bar_safe(self, value):
+        self.progress_bar['value'] = value
+
+    def update_progress_label_safe(self, text):
+        self.progress_label_var.set(text)
 
     def _load_local_video_files(self, folder_path):
         self.local_files_listbox.delete(0, tk.END)
